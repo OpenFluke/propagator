@@ -26,6 +26,16 @@ var hosts = []string{
 	"192.168.0.227",
 }
 
+// Planet represents a planet object from the server.
+type Planet struct {
+	Position          map[string]float64   `json:"Position"`
+	Seed              int                  `json:"Seed"`
+	Name              string               `json:"Name"`
+	ResourceLocations []map[string]float64 `json:"ResourceLocations"`
+	TreeLocations     []map[string]float64 `json:"TreeLocations"`
+	BiomeType         int                  `json:"BiomeType"`
+}
+
 // PodResult holds the result of a connection attempt to a pod.
 type PodResult struct {
 	Host    string
@@ -33,18 +43,15 @@ type PodResult struct {
 	Success bool
 	Error   string
 	Cubes   []string
-	Planets []interface{}
+	Planets []Planet
 }
 
 func main() {
-	// Record the start time for timing the entire operation
 	startTime := time.Now()
-
-	// Synchronization tools
 	var wg sync.WaitGroup
-	resultsChan := make(chan PodResult, numPods*len(hosts)) // Buffered channel to collect results
+	resultsChan := make(chan PodResult, numPods*len(hosts))
 
-	// Launch goroutines to connect to all pods concurrently
+	// Launch goroutines to check all pods concurrently
 	for _, host := range hosts {
 		for i := 0; i < numPods; i++ {
 			port := startPort + i*portStep
@@ -57,11 +64,10 @@ func main() {
 		}
 	}
 
-	// Wait for all goroutines to finish
 	wg.Wait()
-	close(resultsChan) // Close the channel after all goroutines are done
+	close(resultsChan)
 
-	// Collect and process results
+	// Process results
 	var results []PodResult
 	totalCubes := 0
 	totalPlanets := 0
@@ -76,7 +82,7 @@ func main() {
 		}
 	}
 
-	// Print the summary
+	// Print summary
 	fmt.Println("\n=== MULTIVERSE SUMMARY ===")
 	for _, res := range results {
 		if res.Success {
@@ -90,13 +96,10 @@ func main() {
 	fmt.Printf("\nTotal successful connections: %d / %d\n", successCount, numPods*len(hosts))
 	fmt.Printf("TOTAL CUBES ACROSS MULTIVERSE: %d\n", totalCubes)
 	fmt.Printf("TOTAL PLANETS ACROSS MULTIVERSE: %d\n", totalPlanets)
-
-	// Calculate and display the total time taken
-	elapsed := time.Since(startTime)
-	fmt.Printf("Total time taken: %s\n", elapsed)
+	fmt.Printf("Total time taken: %s\n", time.Since(startTime))
 }
 
-// checkPod attempts to connect to a pod, authenticate, and retrieve data.
+// checkPod connects to a pod, authenticates, and retrieves cube and planet data.
 func checkPod(host string, port int) PodResult {
 	addr := fmt.Sprintf("%s:%d", host, port)
 	conn, err := net.DialTimeout("tcp", addr, time.Duration(timeoutSec)*time.Second)
@@ -110,21 +113,36 @@ func checkPod(host string, port int) PodResult {
 	}
 	defer conn.Close()
 
-	// Send authentication
-	send(conn, authPass)
+	// Authenticate
+	if err := send(conn, authPass); err != nil {
+		return PodResult{
+			Host:    host,
+			Port:    port,
+			Success: false,
+			Error:   fmt.Sprintf("Failed to send auth: %v", err),
+		}
+	}
 	authResp := read(conn)
 	if !strings.Contains(authResp, "auth_success") {
 		return PodResult{
 			Host:    host,
 			Port:    port,
 			Success: false,
-			Error:   "Authentication failed or invalid response",
+			Error:   fmt.Sprintf("Authentication failed: %s", authResp),
 		}
 	}
 
 	// Get cubes
-	send(conn, `{"type":"get_cube_list"}`)
+	if err := send(conn, `{"type":"get_cube_list"}`); err != nil {
+		return PodResult{
+			Host:    host,
+			Port:    port,
+			Success: false,
+			Error:   fmt.Sprintf("Failed to request cubes: %v", err),
+		}
+	}
 	cubesRaw := read(conn)
+	fmt.Printf("[%s:%d] Raw cube response: %s\n", host, port, cubesRaw)
 	var cubeData map[string]interface{}
 	if err := json.Unmarshal([]byte(cubesRaw), &cubeData); err != nil {
 		return PodResult{
@@ -134,12 +152,28 @@ func checkPod(host string, port int) PodResult {
 			Error:   fmt.Sprintf("Failed to parse cube list: %v", err),
 		}
 	}
+	if cubeData["type"] != "cube_list" {
+		return PodResult{
+			Host:    host,
+			Port:    port,
+			Success: false,
+			Error:   fmt.Sprintf("Invalid cube response type: %v", cubeData["type"]),
+		}
+	}
 	cubes := toStringArray(cubeData["cubes"])
 
 	// Get planets
-	send(conn, `{"type":"get_planets"}`)
+	if err := send(conn, `{"type":"get_planets"}`); err != nil {
+		return PodResult{
+			Host:    host,
+			Port:    port,
+			Success: false,
+			Error:   fmt.Sprintf("Failed to request planets: %v", err),
+		}
+	}
 	planetsRaw := read(conn)
-	var planetData map[string]interface{}
+	//fmt.Printf("[%s:%d] Raw planet response: %s\n", host, port, planetsRaw)
+	var planetData map[string][]Planet
 	if err := json.Unmarshal([]byte(planetsRaw), &planetData); err != nil {
 		return PodResult{
 			Host:    host,
@@ -148,48 +182,52 @@ func checkPod(host string, port int) PodResult {
 			Error:   fmt.Sprintf("Failed to parse planet list: %v", err),
 		}
 	}
-	planets := toInterfaceArray(planetData["planets"])
+	// Flatten the planets
+	var allPlanets []Planet
+	for _, planets := range planetData {
+		allPlanets = append(allPlanets, planets...)
+	}
 
-	// Success case
 	return PodResult{
 		Host:    host,
 		Port:    port,
 		Success: true,
 		Cubes:   cubes,
-		Planets: planets,
+		Planets: allPlanets,
 	}
 }
 
-// send writes a message with the end marker.
-func send(conn net.Conn, msg string) {
+// send writes a message with the end marker and returns any error.
+func send(conn net.Conn, msg string) error {
 	_, err := conn.Write([]byte(msg + endMarker))
 	if err != nil {
-		fmt.Printf("  Error sending message to %s: %v\n", conn.RemoteAddr().String(), err)
+		fmt.Printf("Error sending to %s: %v\n", conn.RemoteAddr().String(), err)
 	}
+	return err
 }
 
-// read reads until the end marker is found.
+// read reads until the end marker is found, with a timeout.
 func read(conn net.Conn) string {
 	reader := bufio.NewReader(conn)
 	conn.SetReadDeadline(time.Now().Add(timeoutSec * time.Second))
 	var buf bytes.Buffer
-
+	chunk := make([]byte, 1024)
 	for {
-		b, err := reader.ReadByte()
-		if err != nil {
-			if err != io.EOF {
-				fmt.Printf("  Read error from %s: %v\n", conn.RemoteAddr().String(), err)
-			}
+		n, err := reader.Read(chunk)
+		if err != nil && err != io.EOF {
+			fmt.Printf("Read error from %s: %v\n", conn.RemoteAddr().String(), err)
 			break
 		}
-		buf.WriteByte(b)
-		if buf.Len() >= len(endMarker) && strings.HasSuffix(buf.String(), endMarker) {
+		buf.Write(chunk[:n])
+		if strings.HasSuffix(buf.String(), endMarker) {
+			break
+		}
+		if err == io.EOF {
 			break
 		}
 	}
-
 	msg := buf.String()
-	if len(msg) >= len(endMarker) {
+	if len(msg) >= len(endMarker) && strings.HasSuffix(msg, endMarker) {
 		return msg[:len(msg)-len(endMarker)]
 	}
 	return msg
@@ -200,18 +238,14 @@ func toStringArray(v interface{}) []string {
 	if v == nil {
 		return []string{}
 	}
-	arrI := v.([]interface{})
+	arrI, ok := v.([]interface{})
+	if !ok {
+		fmt.Printf("Warning: 'cubes' is not an array: %v\n", v)
+		return []string{}
+	}
 	arr := make([]string, 0, len(arrI))
 	for _, x := range arrI {
 		arr = append(arr, fmt.Sprintf("%v", x))
 	}
 	return arr
-}
-
-// toInterfaceArray converts an interface{} to an interface slice.
-func toInterfaceArray(v interface{}) []interface{} {
-	if v == nil {
-		return []interface{}{}
-	}
-	return v.([]interface{})
 }
