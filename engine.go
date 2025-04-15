@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"strings"
 	"sync"
@@ -15,7 +16,7 @@ import (
 const (
 	startPort  = 10002
 	portStep   = 3
-	numPods    = 100
+	numPods    = 10
 	authPass   = "my_secure_password"
 	endMarker  = "<???DONE???---"
 	timeoutSec = 10 // 10-second timeout
@@ -97,6 +98,19 @@ func main() {
 	fmt.Printf("TOTAL CUBES ACROSS MULTIVERSE: %d\n", totalCubes)
 	fmt.Printf("TOTAL PLANETS ACROSS MULTIVERSE: %d\n", totalPlanets)
 	fmt.Printf("Total time taken: %s\n", time.Since(startTime))
+
+	// Filter successful pods
+	var successfulPods []PodResult
+	for _, res := range results { // 'results' from previous operations
+		if res.Success {
+			successfulPods = append(successfulPods, res)
+		}
+	}
+
+	//nuke(successfulPods)
+
+	// Run the load balancing test
+	//loadBalancingTest(successfulPods)
 }
 
 // checkPod connects to a pod, authenticates, and retrieves cube and planet data.
@@ -248,4 +262,158 @@ func toStringArray(v interface{}) []string {
 		arr = append(arr, fmt.Sprintf("%v", x))
 	}
 	return arr
+}
+
+// loadBalancingTest performs a load balancing test by spawning cubes at planet coordinates.
+func loadBalancingTest(pods []PodResult) {
+	// Define the batch sizes for the test
+	batchSizes := []int{10 /*20 40, 50*/ /*200, 300, 400, 500*/}
+
+	// Iterate over each batch size
+	for _, batchSize := range batchSizes {
+		fmt.Printf("Starting load balancing test with %d cubes per planet\n", batchSize)
+		// Remove all cubes before starting the batch
+		//nuke(pods)
+		var wg sync.WaitGroup
+
+		// Process each pod concurrently
+		for _, pod := range pods {
+			wg.Add(1)
+			go func(pod PodResult) {
+				defer wg.Done()
+
+				// Connect to the pod
+				conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", pod.Host, pod.Port), time.Duration(timeoutSec)*time.Second)
+				if err != nil {
+					fmt.Printf("  Failed to connect to %s:%d: %v\n", pod.Host, pod.Port, err)
+					return
+				}
+				defer conn.Close()
+
+				// Authenticate with the pod
+				if err := send(conn, authPass); err != nil {
+					fmt.Printf("  Failed to send auth to %s:%d: %v\n", pod.Host, pod.Port, err)
+					return
+				}
+				authResp := read(conn)
+				if !strings.Contains(authResp, "auth_success") {
+					fmt.Printf("  Authentication failed for %s:%d: %s\n", pod.Host, pod.Port, authResp)
+					return
+				}
+
+				// Spawn cubes for each planet
+				for _, planet := range pod.Planets {
+					position := planet.Position
+					x, xOk := position["x"]
+					y, yOk := position["y"]
+					z, zOk := position["z"]
+					if !xOk || !yOk || !zOk {
+						fmt.Printf("  Invalid position for planet %s on %s:%d\n", planet.Name, pod.Host, pod.Port)
+						continue
+					}
+
+					// Spawn 'batchSize' cubes per planet
+					for i := 0; i < batchSize; i++ {
+						// Add a small random offset to avoid overlap
+						offsetX := rand.Float64()*2 - 1 // Random float between -1 and 1
+						offsetY := rand.Float64()*2 - 1
+						offsetZ := rand.Float64()*2 - 1
+						spawnPos := []float64{x + offsetX, y + offsetY, z + offsetZ}
+
+						// Create the spawn_cube command
+						spawnCmd := map[string]interface{}{
+							"type":     "spawn_cube",
+							"position": spawnPos,
+							"rotation": []float64{0, 0, 0}, // Default rotation
+						}
+						cmdJSON, err := json.Marshal(spawnCmd)
+						if err != nil {
+							fmt.Printf("  Failed to marshal spawn command: %v\n", err)
+							continue
+						}
+
+						// Send the spawn command
+						if err := send(conn, string(cmdJSON)); err != nil {
+							fmt.Printf("  Failed to send spawn command to %s:%d: %v\n", pod.Host, pod.Port, err)
+							return
+						}
+					}
+				}
+				fmt.Printf("  Completed spawning %d cubes on %d planets for pod %s:%d\n", batchSize, len(pod.Planets), pod.Host, pod.Port)
+			}(pod)
+		}
+
+		// Wait for all pods to complete spawning for this batch
+		wg.Wait()
+		fmt.Printf("Batch of %d cubes per planet finished. Waiting 10 seconds...\n", batchSize)
+		time.Sleep(10 * time.Second)
+	}
+
+	// Remove all cubes before starting the batch
+	//nuke(pods)
+	fmt.Println("Load balancing test completed successfully.")
+}
+
+func nuke(pods []PodResult) {
+	var wg sync.WaitGroup
+
+	for _, pod := range pods {
+		wg.Add(1)
+		go func(pod PodResult) {
+			defer wg.Done()
+
+			addr := fmt.Sprintf("%s:%d", pod.Host, pod.Port)
+			conn, err := net.DialTimeout("tcp", addr, time.Duration(timeoutSec)*time.Second)
+			if err != nil {
+				fmt.Printf("  Failed to connect to %s: %v\n", addr, err)
+				return
+			}
+			defer conn.Close()
+
+			if err := send(conn, authPass); err != nil {
+				fmt.Printf("  Auth error on %s: %v\n", addr, err)
+				return
+			}
+			if !strings.Contains(read(conn), "auth_success") {
+				fmt.Printf("  Auth failed on %s\n", addr)
+				return
+			}
+
+			// Max retries
+			maxRetries := 5
+
+			for attempt := 1; attempt <= maxRetries; attempt++ {
+				if err := send(conn, `{"type":"get_cube_list"}`); err != nil {
+					fmt.Printf("  Failed to get cube list on %s: %v\n", addr, err)
+					return
+				}
+				raw := read(conn)
+
+				var cubeData map[string]interface{}
+				if err := json.Unmarshal([]byte(raw), &cubeData); err != nil {
+					fmt.Printf("  JSON error from %s: %v\n", addr, err)
+					return
+				}
+
+				cubes := toStringArray(cubeData["cubes"])
+				if len(cubes) == 0 {
+					fmt.Printf("  All cubes cleared on %s\n", addr)
+					break
+				}
+
+				for _, cube := range cubes {
+					cmd := fmt.Sprintf(`{"type":"despawn_cube","cube_name":"%s"}`, cube)
+					if err := send(conn, cmd); err != nil {
+						fmt.Printf("  Failed to despawn %s on %s: %v\n", cube, addr, err)
+					}
+				}
+
+				fmt.Printf("  NUKED %d cubes on %s (pass %d)\n", len(cubes), addr, attempt)
+				time.Sleep(500 * time.Millisecond) // Let the server process it
+			}
+		}(pod)
+	}
+
+	wg.Wait()
+	fmt.Println("NUKE phase completed with verification passes.")
 }
